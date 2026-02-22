@@ -1,0 +1,50 @@
+# Build directories
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+
+# Visual Studio files
+.vs/
+*.sln.DotSettings
+*.user
+*.VC.db
+*.VC.opendb
+
+# Build artifacts
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# IDE files
+.vscode/
+*.sln
+*.vcxproj.user
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependencies
+packages/
+
+# Logs
+*.log
+
+# Temp files
+*.tmp
+*~
+
+data/
+logs/
+__pycache__/
+*.pyc
+cache/
+checkpoints/
+plots/
