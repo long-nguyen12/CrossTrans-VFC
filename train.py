@@ -48,17 +48,6 @@ def compute_class_weights(dataset, num_classes: int, device: torch.device):
     return weights.to(device), counts
 
 
-def load_checkpoint_compat(path: Path, device: torch.device):
-    """
-    Compatibility loader for PyTorch>=2.6 where torch.load defaults to weights_only=True.
-    """
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        # Older torch versions do not support the weights_only argument.
-        return torch.load(path, map_location=device)
-
-
 @torch.no_grad()
 def evaluate(model, loader, device, loss_func) -> Dict[str, float]:
     """Evaluate model on a dataloader."""
@@ -155,6 +144,9 @@ def main():
     patience = 5
 
     cfg = MMConfig(
+        _claim_pt="roberta-base",
+        _long_pt="longformer",
+        _video_pt="vjepa2",
         num_classes=2,
         freeze_text=True,
         freeze_long_text=True,
@@ -191,7 +183,9 @@ def main():
         [int(sample["label"].argmax().item()) for sample in train_dataset],
         dtype=torch.long,
     )
-    class_counts_sampler = torch.bincount(sample_labels, minlength=cfg.num_classes).float()
+    class_counts_sampler = torch.bincount(
+        sample_labels, minlength=cfg.num_classes
+    ).float()
     class_counts_sampler = class_counts_sampler.clamp_min(1.0)
     sample_class_weights = class_counts_sampler.sum() / (
         cfg.num_classes * class_counts_sampler
@@ -210,7 +204,7 @@ def main():
         pin_memory=True if device.type == "cuda" else False,
         collate_fn=train_loader.collate_fn,
     )
-    return train_loader, val_loader, test_loader
+
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
     print(f"Test batches: {len(test_loader)}")
@@ -350,7 +344,7 @@ def main():
     print(f"{'='*70}")
 
     best_checkpoint = run_dir / "best.pt"
-    checkpoint = load_checkpoint_compat(best_checkpoint, device)
+    checkpoint = torch.load(best_checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["state_dict"])
     print(f"Loaded best model from epoch {checkpoint['epoch']}")
     print(
