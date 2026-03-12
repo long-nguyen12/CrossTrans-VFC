@@ -1,6 +1,9 @@
+import argparse
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
 import os
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +12,10 @@ from transformers import AutoTokenizer, AutoModel, AutoVideoProcessor
 from transformers import LongformerTokenizer, LongformerModel
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from transformers import VideoMAEImageProcessor, AutoConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.vid_extractor import extract_long_video
 from models.modules import MultimodalFusionModule, MultiHeadGatedFusion
@@ -89,8 +96,12 @@ class MMFactCheckingClassifier(nn.Module):
             dropout=cfg.mfm_dropout,
         )
 
+        self.inter_claim = nn.Linear(text_dim, out_fusion_dim)
+        self.inter_video = nn.Linear(video_dim, out_fusion_dim)
+        self.inter_evidence = nn.Linear(long_text_dim, out_fusion_dim)
+
         self.dropout = nn.Dropout(cfg.cls_dropout)
-        self.classifier = nn.Linear(2 * cfg.mfm_out_dim, cfg.num_classes)
+        self.classifier = nn.Linear(out_fusion_dim, cfg.num_classes)
 
     def video_model(self, type="videomae"):
         if type == "videomae":
@@ -314,11 +325,53 @@ class MMFactCheckingClassifier(nn.Module):
             img_mask=evidence_mask,
         )  # (B, D_mfm)
 
-        h = torch.cat([claim_visual_fused, claim_evidence_fused], dim=-1)
-        # h = self.fusion_mlp(claim_visual_fused, claim_evidence_fused)
+        # h = torch.cat([claim_visual_fused, claim_evidence_fused], dim=-1)
+        h = self.fusion_mlp(claim_visual_fused, claim_evidence_fused)
+        h = (
+            h
+            + self.inter_claim(claim_tokens).mean(dim=1)
+            + self.inter_video(video_tokens.mean(dim=1))
+            + self.inter_evidence(evidence_tokens.mean(dim=1))
+        )
         h = self.dropout(h)
         logits = self.classifier(h)  # (B, num_classes)
         probs = F.softmax(logits, dim=-1)
 
         out = {"logits": logits, "probs": probs}
         return out
+
+
+@torch.no_grad()
+def run_quick_test(device_str: str = ""):
+    device = torch.device(
+        device_str or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    cfg = MMConfig(num_classes=2)
+    model = MMFactCheckingClassifier(cfg).to(device)
+    model.eval()
+
+    out = model(
+        claim=["This claim is for smoke testing."],
+        text_evidence=["This is a short evidence sentence."],
+        video_evidence=[None],
+    )
+
+    logits = out["logits"]
+    probs = out["probs"]
+    preds = logits.argmax(dim=-1)
+
+    print(f"Device: {device}")
+    print(f"Logits shape: {tuple(logits.shape)}")
+    print(f"Probs shape: {tuple(probs.shape)}")
+    print(f"Predictions: {preds.cpu().tolist()}")
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Quick smoke test for model forward.")
+    parser.add_argument("--device", type=str, default="")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    run_quick_test(device_str=args.device)

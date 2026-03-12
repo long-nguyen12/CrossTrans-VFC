@@ -88,7 +88,7 @@ def main():
     parser.add_argument(
         "--data-root",
         type=str,
-        default="./data/TRUE_Dataset",
+        default="../TRUE-3MFact/data/TRUE_Dataset",
         help="Dataset root directory",
     )
     parser.add_argument(
@@ -111,7 +111,7 @@ def main():
 
     cfg = build_cfg_from_checkpoint(checkpoint)
     model = MMFactCheckingClassifier(cfg).to(device)
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
 
     label2id = checkpoint.get("label2id", {"TRUE": 0, "FALSE": 1})
     id2label = {v: k for k, v in label2id.items()}

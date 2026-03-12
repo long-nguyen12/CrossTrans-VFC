@@ -142,7 +142,7 @@ def train_one_epoch(
 
 
 def main():
-    DATA_ROOT = Path("../TRUE-3MFact/data/TRUE_Dataset")
+    DATA_ROOT = Path("./data/TRUE_Dataset")
     print(f"Using dataset module: {true_dataset_module.__file__}")
 
     # ====== Training hyperparams ======
@@ -210,7 +210,7 @@ def main():
         pin_memory=True if device.type == "cuda" else False,
         collate_fn=train_loader.collate_fn,
     )
-
+    return train_loader, val_loader, test_loader
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
     print(f"Test batches: {len(test_loader)}")

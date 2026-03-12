@@ -124,6 +124,7 @@ def clip_chunk_keyframes_extraction(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor, model = _load_clip_vision(model_name)
     model.to(device)
+    print(f"Using device: {device}")
 
     target_path.mkdir(parents=True, exist_ok=True)
     saved = 0
@@ -165,15 +166,18 @@ def clip_chunk_keyframes_extraction(
 
 
 def process_folder_videos():
-    root_dir = DATASET_CONFIG["root_dir"]
-    test_annotation = os.path.join(root_dir, DATASET_CONFIG["annotation"]["train_val"])
-    test_video_dir = os.path.join(root_dir, DATASET_CONFIG["video_dir"]["train_val"])
+    # root_dir = DATASET_CONFIG["root_dir"]
+    dataset_root = Path("../../TRUE-3MFact/data/TRUE_Dataset").resolve()
+    # Writable output root
+    output_root = Path("/home/jovyan/work/MFS-MS/TRUE_outputs").resolve()
 
-    test_output_dir = os.path.join(root_dir, DATASET_CONFIG["output_dir"]["train_val"])
+    test_annotation = dataset_root / DATASET_CONFIG["annotation"]["test"]
+    test_video_dir = dataset_root / DATASET_CONFIG["video_dir"]["test"]
 
-    if not os.path.exists(test_output_dir):
-        os.makedirs(test_output_dir)
+    test_output_dir = output_root / DATASET_CONFIG["output_dir"]["test"]
 
+    test_output_dir.mkdir(parents=True, exist_ok=True)
+    
     with open(test_annotation, "r") as f:
         video_ids = [line.strip() for line in f if line.strip()]
 

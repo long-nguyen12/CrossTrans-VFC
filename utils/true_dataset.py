@@ -8,7 +8,8 @@ import re
 from torch.utils.data import DataLoader
 from collections import Counter
 import matplotlib.pyplot as plt
-
+from glob import glob
+from PIL import Image, ImageFilter, ImageOps
 
 DATA_PATH = "data/TRUE_Dataset"
 
@@ -101,6 +102,28 @@ def resolve_video_path(claim_id: str, data_path: str = DATA_PATH) -> str:
     return str(root / "test_video" / f"{claim_id}.mp4")
 
 
+def resolve_keyframe_path(claim_id: str, data_path: str = DATA_PATH) -> str:
+    if not claim_id:
+        return ""
+
+    root = Path(data_path)
+    candidates = [
+        root / "train_val_output" / claim_id,
+        root / "test_output" / claim_id,
+    ]
+    frames = []
+    for path in candidates:
+        if path.exists():
+            frame_path = path / "*.jpeg"
+            keyframe_files = glob(str(frame_path))
+            if keyframe_files:
+                for kf in keyframe_files:
+                    frame = Image.open(kf).convert("RGB")
+                    frames.append(frame)
+                return frames
+    return frames
+
+
 def rating_to_label(rating_str):
     rating_lower = rating_str.lower()
 
@@ -131,6 +154,7 @@ def encode_one_sample(sample):
     video_headline = clean_data(video_info.get("video_headline", ""))
 
     image_evidence = sample.get("image_evidence", [])
+    keyframes = resolve_keyframe_path(claim_id)
 
     encoded_sample = {
         "claim_id": claim_id,
@@ -146,6 +170,7 @@ def encode_one_sample(sample):
         "image_evidence": image_evidence,
         "url": sample.get("url", ""),
         "content": clean_data(sample.get("content", "")),
+        "keyframes": keyframes,
     }
 
     return encoded_sample
