@@ -48,3 +48,8 @@ __pycache__/
 cache/
 checkpoints/
 plots/
+models/model copy.py
+
+models/model_best.py
+
+utils/statistics.py
