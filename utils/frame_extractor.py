@@ -2,12 +2,13 @@ import logging
 import os
 from pathlib import Path
 from config import DATASET_CONFIG, VIDEO_DESCRIPTOR_CONFIG
+import argparse
 
 import cv2
 import torch
 from transformers import CLIPImageProcessor, CLIPVisionModel
 from sklearn.cluster import SpectralClustering
-
+import time
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -92,12 +93,14 @@ def _select_representative_frame_spectral(frames, embeddings, n_clusters):
 
 
 def clip_chunk_keyframes_extraction(
+    model,
+    processor,
     video_file_path,
     chunk_count=10,
     samples_per_chunk=8,
-    model_name="openai/clip-vit-base-patch32",
     spectral_clusters=2,
     output_dir=None,
+    device=None,
 ):
     video_path = Path(video_file_path)
     if output_dir is None:
@@ -121,9 +124,6 @@ def clip_chunk_keyframes_extraction(
     chunk_count = min(chunk_count, total_frames)
     chunk_size = total_frames / chunk_count
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    processor, model = _load_clip_vision(model_name)
-    model.to(device)
     print(f"Using device: {device}")
 
     target_path.mkdir(parents=True, exist_ok=True)
@@ -142,12 +142,18 @@ def clip_chunk_keyframes_extraction(
             indices = list(range(start, end, step))[:samples_per_chunk]
 
         frames = _read_frames_at_indices(cap, indices)
+        start = time.time()
         embeddings = _select_representative_frame(frames, processor, model, device)
+        end = time.time()
+        print("Encoded time is: ", end - start)
         if embeddings is None:
             continue
+        start = time.time()
         best_frame = _select_representative_frame_spectral(
             frames, embeddings, spectral_clusters
         )
+        end = time.time()
+        print("Clustering time is: ", end - start)
         if best_frame is None:
             continue
 
@@ -165,25 +171,31 @@ def clip_chunk_keyframes_extraction(
     return str(target_path)
 
 
-def process_folder_videos():
-    # root_dir = DATASET_CONFIG["root_dir"]
-    dataset_root = Path("../../TRUE-3MFact/data/TRUE_Dataset").resolve()
+def process_folder_videos(args):
+    dataset_root = Path(f"{DATASET_CONFIG['root_dir']}").resolve()
     # Writable output root
-    output_root = Path("/home/jovyan/work/MFS-MS/TRUE_outputs").resolve()
+    output_root = Path(f"{DATASET_CONFIG['root_dir']}").resolve()
 
-    test_annotation = dataset_root / DATASET_CONFIG["annotation"]["test"]
-    test_video_dir = dataset_root / DATASET_CONFIG["video_dir"]["test"]
+    test_annotation = dataset_root / DATASET_CONFIG["annotation"][args.split]
+    test_video_dir = dataset_root / DATASET_CONFIG["video_dir"][args.split]
 
-    test_output_dir = output_root / DATASET_CONFIG["output_dir"]["test"]
+    test_output_dir = output_root / DATASET_CONFIG["output_dir"][args.split]
 
     test_output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     with open(test_annotation, "r") as f:
         video_ids = [line.strip() for line in f if line.strip()]
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_name = VIDEO_DESCRIPTOR_CONFIG.get(
+        "clip_model_name", "openai/clip-vit-base-patch32"
+    )
+    processor, model = _load_clip_vision(model_name)
+    model.to(device)
+
     for i, video_id in enumerate(video_ids):
         try:
-            logging.info(f"Processing video {i+1}/{len(video_ids)}: {video_id}")
+            logging.info(f"Processing video {i + 1}/{len(video_ids)}: {video_id}")
 
             video_file = None
             for ext in [".mp4", ".mkv"]:
@@ -207,19 +219,19 @@ def process_folder_videos():
                 samples_per_chunk = VIDEO_DESCRIPTOR_CONFIG.get(
                     "clip_samples_per_chunk", 8
                 )
-                model_name = VIDEO_DESCRIPTOR_CONFIG.get(
-                    "clip_model_name", "openai/clip-vit-base-patch32"
-                )
                 spectral_clusters = VIDEO_DESCRIPTOR_CONFIG.get(
                     "spectral_clusters_per_chunk", 2
                 )
+
                 _ = clip_chunk_keyframes_extraction(
+                    model,
+                    processor,
                     video_file,
                     chunk_count=chunk_count,
                     samples_per_chunk=samples_per_chunk,
-                    model_name=model_name,
                     spectral_clusters=spectral_clusters,
                     output_dir=test_output_dir,
+                    device=device,
                 )
                 logging.info(f"Keyframes extracted successfully for video: {video_id}")
             except Exception as e:
@@ -234,4 +246,25 @@ def process_folder_videos():
 
 
 if __name__ == "__main__":
-    process_folder_videos()
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default="../data/TRUE_Dataset",
+        help="Dataset root directory",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["train_val", "test"],
+        help="Dataset split to evaluate",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default="data/video_cache",
+        help="Dir with pre-extracted video feature .pt files",
+    )
+    args = parser.parse_args()
+    process_folder_videos(args)
