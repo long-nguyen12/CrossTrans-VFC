@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from collections import Counter
 import matplotlib.pyplot as plt
 from glob import glob
-from PIL import Image, ImageFilter, ImageOps
+from PIL import ImageFilter, ImageOps
 
 DATA_PATH = "data/TRUE_Dataset"
 
@@ -43,9 +43,6 @@ def get_dataset(path):
     split_idx = int(len(all_train_data) * 0.8)
     train_data = all_train_data[:split_idx]
     val_data = all_train_data[split_idx:]
-
-    # train_data = all_train_data
-    # val_data = all_train_data
 
     print(f"Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
@@ -102,9 +99,9 @@ def resolve_video_path(claim_id: str, data_path: str = DATA_PATH) -> str:
     return str(root / "test_video" / f"{claim_id}.mp4")
 
 
-def resolve_keyframe_path(claim_id: str, data_path: str = DATA_PATH) -> str:
+def resolve_keyframe_path(claim_id: str, data_path: str = DATA_PATH) -> list:
     if not claim_id:
-        return ""
+        return []
 
     root = Path(data_path)
     candidates = [
@@ -118,8 +115,7 @@ def resolve_keyframe_path(claim_id: str, data_path: str = DATA_PATH) -> str:
             keyframe_files = glob(str(frame_path))
             if keyframe_files:
                 for kf in keyframe_files:
-                    frame = Image.open(kf).convert("RGB")
-                    frames.append(frame)
+                    frames.append(kf)
                 return frames
     return frames
 
@@ -141,7 +137,6 @@ def encode_one_sample(sample):
     claim = clean_data(sample.get("claim", ""))
     rating_str = sample.get("rating")
     label_idx = rating_to_label(rating_str)
-    content = sample.get("content", "")
     evidences_dict = sample.get("evidences", {})
     text_evidence = extract_evidence_text(evidences_dict)
 
@@ -159,7 +154,6 @@ def encode_one_sample(sample):
     encoded_sample = {
         "claim_id": claim_id,
         "claim": claim,
-        "content": content,
         "label": torch.tensor(one_hot(label_idx, 2), dtype=torch.float),
         "rating": rating_str,
         "text_evidence": text_evidence,
@@ -213,7 +207,7 @@ def collate_claim_verification(batch):
     video_headlines = [item["video_headline"] for item in batch]
     image_evidences = [item["image_evidence"] for item in batch]
     urls = [item["url"] for item in batch]
-    contents = [item["content"] for item in batch]
+    keyframes = [item["keyframes"] for item in batch]
 
     return {
         "claim_id": claim_ids,
@@ -228,7 +222,7 @@ def collate_claim_verification(batch):
         "video_headline": video_headlines,
         "image_evidence": image_evidences,
         "url": urls,
-        "content": contents,
+        "keyframes": keyframes,
     }
 
 
@@ -246,36 +240,43 @@ def create_dataloaders(
         train_data = train_data[:limit_samples]
         val_data = val_data[:limit_samples]
         test_data = test_data[:limit_samples]
+    try:
+        train_dataset = ClaimVerificationDataset(train_data)
+        val_dataset = ClaimVerificationDataset(val_data)
+        test_dataset = ClaimVerificationDataset(test_data)
+    except Exception as e:
+        print(f"Error creating dataset: {e}")
+        return None, None, None
 
-    train_dataset = ClaimVerificationDataset(train_data)
-    val_dataset = ClaimVerificationDataset(val_data)
-    test_dataset = ClaimVerificationDataset(test_data)
+    try:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle_train,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_claim_verification,
+        )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle_train,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_claim_verification,
-    )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_claim_verification,
+        )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_claim_verification,
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=collate_claim_verification,
-    )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate_claim_verification,
+        )
+    except Exception as e:
+        print(f"Error creating dataloader: {e}")
+        return None, None, None
 
     return train_loader, val_loader, test_loader

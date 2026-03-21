@@ -24,7 +24,7 @@ MODEL_CONFIG = {
 VIDEO_DESCRIPTOR_CONFIG = {
     "keyframe_extractor": "clip_chunk",  # Method used for keyframe extraction
     "chunk_count": 7,  # For CLIP chunk extractor: number of chunks
-    "clip_samples_per_chunk": 8,  # For CLIP chunk extractor: candidate frames per chunk
+    "clip_samples_per_chunk": 32,  # For CLIP chunk extractor: candidate frames per chunk
     "clip_model_name": "openai/clip-vit-base-patch32",  # CLIP vision backbone
     "spectral_clusters_per_chunk": 2,  # Spectral clustering clusters per chunk
 }

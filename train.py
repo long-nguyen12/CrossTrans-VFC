@@ -1,13 +1,10 @@
 import os
 import json
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Dict, Optional
+import argparse
 import numpy as np
-import pandas as pd
-from PIL import Image
 
 import torch
 import torch.nn as nn
@@ -16,14 +13,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 
-from transformers import (
-    get_linear_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-)
+from transformers import get_cosine_schedule_with_warmup
 
 from utils.true_dataset import create_dataloaders
 import utils.true_dataset as true_dataset_module
-from models.model import MMFactCheckingClassifier, MMConfig
+from models.model import CrossTransVFC, MMConfig
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -49,7 +43,7 @@ def compute_class_weights(dataset, num_classes: int, device: torch.device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, loss_func) -> Dict[str, float]:
+def evaluate(model, loader, device, loss_func, desc="Evaluating") -> Dict[str, Any]:
     """Evaluate model on a dataloader."""
     model.eval()
 
@@ -57,13 +51,13 @@ def evaluate(model, loader, device, loss_func) -> Dict[str, float]:
     total_loss = 0.0
     n = 0
 
-    for batch in tqdm(loader, desc="Evaluating"):
+    for batch in tqdm(loader, desc=desc):
         labels = normalize_labels(batch["label"]).to(device)
 
         out = model(
             claim=batch["claim"],
             text_evidence=batch["content"],
-            video_evidence=batch["video_url"],
+            image_evidence=batch["keyframes"],
             labels=labels,
         )
 
@@ -84,7 +78,13 @@ def evaluate(model, loader, device, loss_func) -> Dict[str, float]:
     f1m = f1_score(all_y, all_p, average="macro", zero_division=0)
     avg_loss = total_loss / max(n, 1)
 
-    return {"loss": avg_loss, "acc": acc, "f1_macro": f1m}
+    return {
+        "loss": avg_loss,
+        "acc": acc,
+        "f1_macro": f1m,
+        "y_true": all_y,
+        "y_pred": all_p,
+    }
 
 
 def train_one_epoch(
@@ -108,7 +108,7 @@ def train_one_epoch(
         out = model(
             claim=batch["claim"],
             text_evidence=batch["content"],
-            video_evidence=batch["video_url"],
+            image_evidence=batch["keyframes"],
             labels=labels,
         )
 
@@ -130,23 +130,24 @@ def train_one_epoch(
     return total_loss / max(n, 1)
 
 
-def main():
+def main(args):
     DATA_ROOT = Path("./data/TRUE_Dataset")
     print(f"Using dataset module: {true_dataset_module.__file__}")
 
     # ====== Training hyperparams ======
     seed = 42
-    batch_size = 8
+    batch_size = args.batch_size
     epochs = 30
     lr = 3e-5
     warmup_ratio = 0.06
-    num_workers = 4
+    num_workers = 8
     patience = 5
 
     cfg = MMConfig(
-        _claim_pt="roberta-base",
-        _long_pt="longformer",
-        _video_pt="vjepa2",
+        _claim_pt=args.text_model,
+        _long_pt=args.long_text_model,
+        _video_pt=args.video_model,
+        _vision_pt=args.image_model,
         num_classes=2,
         freeze_text=True,
         freeze_long_text=True,
@@ -216,7 +217,7 @@ def main():
     label2id = {"TRUE": 0, "FALSE": 1}
     id2label = {v: k for k, v in label2id.items()}
 
-    model = MMFactCheckingClassifier(cfg)
+    model = CrossTransVFC(cfg)
     model = model.to(device)
 
     class_weights, class_counts = compute_class_weights(
@@ -266,14 +267,14 @@ def main():
         }
         json.dump(config_dict, f, indent=2)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Starting Training")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     for ep in range(1, epochs + 1):
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print(f"Epoch {ep}/{epochs}")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         tr_loss = train_one_epoch(
             model,
@@ -339,9 +340,9 @@ def main():
             break
 
     # ====== Final Testing ======
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("Testing with Best Model")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     best_checkpoint = run_dir / "best.pt"
     checkpoint = torch.load(best_checkpoint, map_location=device, weights_only=True)
@@ -352,39 +353,15 @@ def main():
     )
 
     # Test
-    y_true, y_pred = [], []
-    model.eval()
-    total_test_loss = 0.0
-    n_test = 0
+    test_metrics = evaluate(model, test_loader, device, loss_func, desc="Testing")
 
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testing"):
-            labels = normalize_labels(batch["label"]).to(device)
+    y_true = test_metrics["y_true"]
+    y_pred = test_metrics["y_pred"]
 
-            out = model(
-                claim=batch["claim"],
-                text_evidence=batch["content"],
-                video_evidence=batch["video_url"],
-                labels=labels,
-            )
-
-            logits = out["logits"]
-            loss = loss_func(logits, labels)
-            pred = logits.argmax(dim=-1).cpu().tolist()
-            y_pred.extend(pred)
-            y_true.extend(labels.cpu().tolist())
-
-            total_test_loss += loss.item() * labels.size(0)
-            n_test += labels.size(0)
-
-    test_acc = accuracy_score(y_true, y_pred)
-    test_f1 = f1_score(y_true, y_pred, average="macro")
-    test_loss = total_test_loss / n_test
-
-    print(f"\nTest Results:")
-    print(f"  Loss: {test_loss:.4f}")
-    print(f"  Accuracy: {test_acc:.4f}")
-    print(f"  F1 (macro): {test_f1:.4f}")
+    print("\nTest Results:")
+    print(f"  Loss: {test_metrics['loss']:.4f}")
+    print(f"  Accuracy: {test_metrics['acc']:.4f}")
+    print(f"  F1 (macro): {test_metrics['f1_macro']:.4f}")
 
     print("\nDetailed Classification Report:")
     print(
@@ -393,13 +370,14 @@ def main():
             y_pred,
             target_names=[id2label[i] for i in range(len(label2id))],
             digits=4,
+            zero_division=0,
         )
     )
 
     test_results = {
-        "test_loss": float(test_loss),
-        "test_accuracy": float(test_acc),
-        "test_f1_macro": float(test_f1),
+        "test_loss": float(test_metrics["loss"]),
+        "test_accuracy": float(test_metrics["acc"]),
+        "test_f1_macro": float(test_metrics["f1_macro"]),
         "best_val_f1": float(best_f1),
         "best_val_acc": float(best_acc),
         "predictions": y_pred,
@@ -414,4 +392,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit_samples", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--text_model", type=str, default="roberta-base")
+    parser.add_argument("--long_text_model", type=str, default="longformer")
+    parser.add_argument("--image_model", type=str, default="clip")
+    parser.add_argument("--video_model", type=str, default="videomae")
+    args = parser.parse_args()
+    main(args)

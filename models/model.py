@@ -1,24 +1,43 @@
 import argparse
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List
+from typing import Tuple
 import os
 import sys
 from pathlib import Path
-from glob import glob
 import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from transformers import AutoTokenizer, AutoModel, AutoVideoProcessor, AutoProcessor
+from transformers import AutoTokenizer, AutoModel, AutoProcessor
 from transformers import LongformerTokenizer, LongformerModel
-from transformers import CLIPVisionModel, CLIPImageProcessor
-from transformers import VideoMAEImageProcessor, AutoConfig
 
 from transformers import logging
+import math
 
 logging.set_verbosity_error()
+
+
+class TemporalPositionalEncoding(nn.Module):
+    """
+    Injects timing/sequence information into the visual tokens.
+    """
+
+    def __init__(self, d_model, max_len=1000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len, :]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.vid_extractor import extract_long_video
+from utils.frame_extractor import _extract_image_features
 from models.modules import MultimodalFusionModule, MultiHeadGatedFusion
 
 
@@ -57,7 +77,7 @@ class MMConfig:
     num_classes: int = 3
 
 
-class MMFactCheckingClassifier(nn.Module):
+class CrossTransVFC(nn.Module):
     def __init__(self, cfg: MMConfig):
         super().__init__()
         self.cfg = cfg
@@ -67,18 +87,29 @@ class MMFactCheckingClassifier(nn.Module):
         self._long_text_processor, self._long_text_model = self.text_model_long(
             cfg._long_pt
         )
-        self._image_processor, self._vision_model = self.vision_model(cfg._vision_pt)
-        self._video_processor, self._video_model = self.video_model(cfg._video_pt)
+        if not cfg.use_video:
+            self._vision_processor, self._vision_model = self.vision_model(
+                cfg._vision_pt
+            )
+            vision_dim = self._vision_model.config.projection_dim
+            self._vision_hidden_dim = vision_dim
+        else:
+            self._video_processor, self._video_model = self.video_model(cfg._video_pt)
+            video_dim = self._video_model.config.hidden_size
+            self._video_hidden_dim = video_dim
         self._apply_freeze_policy()
 
         text_dim = self._text_model.config.hidden_size
         long_text_dim = self._long_text_model.config.hidden_size
-        video_dim = self._video_model.config.hidden_size
-        self._video_hidden_dim = video_dim
+
+        vis_dim = (
+            self._vision_hidden_dim if not cfg.use_video else self._video_hidden_dim
+        )
+        self.temporal_pe_vision = TemporalPositionalEncoding(d_model=vis_dim)
 
         self.claim_video_trans = MultimodalFusionModule(
             text_in_dim=text_dim,
-            img_in_dim=video_dim,
+            img_in_dim=vis_dim,
             d_model=cfg.mfm_d_model,
             n_heads=cfg.mfm_heads,
             out_dim=cfg.mfm_out_dim,
@@ -103,10 +134,6 @@ class MMFactCheckingClassifier(nn.Module):
             out_dim=out_fusion_dim,
             dropout=cfg.mfm_dropout,
         )
-
-        self.inter_claim = nn.Linear(text_dim, out_fusion_dim)
-        self.inter_video = nn.Linear(video_dim, out_fusion_dim)
-        self.inter_evidence = nn.Linear(long_text_dim, out_fusion_dim)
 
         self.dropout = nn.Dropout(cfg.cls_dropout)
         self.classifier = nn.Linear(out_fusion_dim, cfg.num_classes)
@@ -170,6 +197,10 @@ class MMFactCheckingClassifier(nn.Module):
                 "id": "facebook/dinov2-base",
                 "requires_trc": True,
             },
+            "vit": {
+                "id": "google/vit-base-patch16-224",
+                "requires_trc": False,
+            },
         }
 
         if type not in model_map:
@@ -183,11 +214,7 @@ class MMFactCheckingClassifier(nn.Module):
         trust_remote = config.get("requires_trc", False)
 
         if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            else:
-                device = "cpu"
-
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading {type} vision model ({model_id}) on {device}...")
 
         try:
@@ -211,10 +238,6 @@ class MMFactCheckingClassifier(nn.Module):
             print(error_msg)
             raise RuntimeError(error_msg)
 
-    # def text_model(self, pt="roberta-base"):
-    #     processor = AutoTokenizer.from_pretrained(pt)
-    #     model = AutoModel.from_pretrained(pt)
-    #     return processor, model
     def text_model(self, model_type="roberta-base", device="auto"):
         MODEL_REGISTRY = {
             "roberta-base": "roberta-base",
@@ -222,6 +245,7 @@ class MMFactCheckingClassifier(nn.Module):
             "bert-base-uncased": "bert-base-uncased",
             "distilbert-base-uncased": "distilbert-base-uncased",
             "allenai/scibert_scivocab_uncased": "allenai/scibert_scivocab_uncased",
+            "clip": "open",
         }
 
         if model_type in MODEL_REGISTRY:
@@ -237,7 +261,6 @@ class MMFactCheckingClassifier(nn.Module):
                 device = "cuda"
             else:
                 device = "cpu"
-
         print(f"Loading {model_id} on {device}...")
 
         try:
@@ -290,10 +313,11 @@ class MMFactCheckingClassifier(nn.Module):
     def _apply_freeze_policy(self) -> None:
         self._set_module_trainable(self._text_model, not self.cfg.freeze_text)
         self._set_module_trainable(self._long_text_model, not self.cfg.freeze_long_text)
-        self._set_module_trainable(self._vision_model, not self.cfg.freeze_vision)
-        self._set_module_trainable(self._video_model, not self.cfg.freeze_video)
+        if not self.cfg.use_video:
+            self._set_module_trainable(self._vision_model, not self.cfg.freeze_vision)
+        else:
+            self._set_module_trainable(self._video_model, not self.cfg.freeze_video)
 
-        # Optional partial unfreezing for text backbones.
         self._unfreeze_last_n_transformer_layers(
             self._text_model, self.cfg.unfreeze_text_last_n
         )
@@ -316,27 +340,29 @@ class MMFactCheckingClassifier(nn.Module):
 
         for vid in video_evidence:
             if vid is None or not isinstance(vid, str) or not os.path.exists(vid):
-                video_feat = torch.zeros(1, video_hidden_dim)  # [1, D]
-                video_mask = torch.zeros(1)  # [1]
+                video_feat = torch.zeros(1, video_hidden_dim, device=device)  # [1, D]
+                video_mask = torch.zeros(1, device=device)  # [1]
             else:
                 try:
                     print(f"Extracting features from video: {vid}")
                     video_feat = extract_long_video(
                         self._video_model, self._video_processor, vid
                     )  # Returns [1, T, D]
-                    video_feat = video_feat.squeeze(0)
-                    video_mask = torch.ones(video_feat.shape[0])  # [T]
+                    video_feat = video_feat.squeeze(0).to(device)
+                    video_mask = torch.ones(video_feat.shape[0], device=device)  # [T]
                 except Exception as e:
                     print(f"Error processing video {vid}: {e}")
-                    video_feat = torch.zeros(1, video_hidden_dim)  # [1, D]
-                    video_mask = torch.zeros(1)  # [1]
+                    video_feat = torch.zeros(
+                        1, video_hidden_dim, device=device
+                    )  # [1, D]
+                    video_mask = torch.zeros(1, device=device)  # [1]
 
             all_video_features.append(video_feat)  # [T, D]
             all_video_masks.append(video_mask)  # [T]
 
         while len(all_video_features) < batch_size:
-            all_video_features.append(torch.zeros(1, video_hidden_dim))
-            all_video_masks.append(torch.zeros(1))
+            all_video_features.append(torch.zeros(1, video_hidden_dim, device=device))
+            all_video_masks.append(torch.zeros(1, device=device))
 
         all_video_features = all_video_features[:batch_size]
         all_video_masks = all_video_masks[:batch_size]
@@ -347,21 +373,144 @@ class MMFactCheckingClassifier(nn.Module):
         padded_masks = []
 
         for feat, mask in zip(all_video_features, all_video_masks):
+            feat = feat.to(device)
+            mask = mask.to(device)
             current_len = feat.shape[0]
             if current_len < max_clips:
                 pad_len = max_clips - current_len
-                feat = torch.cat([feat, torch.zeros(pad_len, video_hidden_dim)], dim=0)
-                mask = torch.cat([mask, torch.zeros(pad_len)], dim=0)
+                feat = torch.cat(
+                    [feat, torch.zeros(pad_len, video_hidden_dim, device=device)], dim=0
+                )
+                mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
 
             padded_features.append(feat)
             padded_masks.append(mask)
 
-        video_tokens = torch.stack(padded_features, dim=0).to(device)  # [B, T, D]
-        video_mask = torch.stack(padded_masks, dim=0).to(device)  # [B, T]
+        video_tokens = torch.stack(padded_features, dim=0)  # [B, T, D]
+        video_mask = torch.stack(padded_masks, dim=0)  # [B, T]
 
         return video_tokens, video_mask
 
-    def forward(self, claim, text_evidence, video_evidence=None, labels=None):
+    def _process_image(self, image_evidence, batch_size, device):
+        if not isinstance(image_evidence, list):
+            image_evidence = [image_evidence]
+
+        if len(image_evidence) != batch_size:
+            print(
+                f"image_evidence length {len(image_evidence)} does not match batch_size {batch_size}; padding with zeros."
+            )
+
+        image_hidden_dim = self._vision_hidden_dim
+        all_image_features = []
+        all_image_masks = []
+
+        for img_item in image_evidence:
+            if not img_item:
+                all_image_features.append(
+                    torch.zeros(1, image_hidden_dim, device=device)
+                )
+                all_image_masks.append(torch.zeros(1, device=device))
+                continue
+
+            try:
+                if isinstance(img_item, list):
+                    item_feats = []
+                    for single_img in img_item:
+                        if isinstance(single_img, str) and os.path.exists(single_img):
+                            try:
+                                single_img = Image.open(single_img).convert("RGB")
+                            except Exception as e:
+                                print(f"Error opening image {single_img}: {e}")
+                                continue
+
+                        f = _extract_image_features(
+                            self._vision_model,
+                            self._vision_processor,
+                            single_img,
+                            device,
+                        )
+                        if f is not None:
+                            if f.dim() == 1:
+                                f = f.unsqueeze(0)
+                            elif f.dim() == 3:
+                                f = f.squeeze(0)
+                            item_feats.append(f)
+
+                    if item_feats:
+                        image_feat = torch.cat(item_feats, dim=0)  # [T, D]
+                    else:
+                        raise ValueError(
+                            f"All image extractions failed for item {img_item}"
+                        )
+                else:
+                    if isinstance(img_item, str) and os.path.exists(img_item):
+                        _img = Image.open(img_item).convert("RGB")
+                    else:
+                        _img = img_item
+
+                    image_feat = _extract_image_features(
+                        self._vision_model,
+                        self._vision_processor,
+                        _img,
+                        device,
+                    )
+                    if image_feat is None:
+                        raise ValueError(f"Feature extraction failed for {img_item}")
+
+                    # Normalize dimensions to [T, D]
+                    if image_feat.dim() == 1:
+                        image_feat = image_feat.unsqueeze(0)
+                    elif image_feat.dim() == 3:
+                        image_feat = image_feat.squeeze(0)
+
+                image_feat = image_feat.to(device)
+                image_mask = torch.ones(image_feat.shape[0], device=device)  # [T]
+            except Exception:
+                image_feat = torch.zeros(1, image_hidden_dim, device=device)  # [1, D]
+                image_mask = torch.zeros(1, device=device)  # [1]
+
+            all_image_features.append(image_feat)  # [T, D]
+            all_image_masks.append(image_mask)  # [T]
+
+        while len(all_image_features) < batch_size:
+            all_image_features.append(torch.zeros(1, image_hidden_dim, device=device))
+            all_image_masks.append(torch.zeros(1, device=device))
+
+        all_image_features = all_image_features[:batch_size]
+        all_image_masks = all_image_masks[:batch_size]
+
+        max_clips = max(feat.shape[0] for feat in all_image_features)
+
+        padded_features = []
+        padded_masks = []
+
+        for feat, mask in zip(all_image_features, all_image_masks):
+            feat = feat.to(device)
+            mask = mask.to(device)
+            current_len = feat.shape[0]
+            if current_len < max_clips:
+                pad_len = max_clips - current_len
+                feat = torch.cat(
+                    [feat, torch.zeros(pad_len, image_hidden_dim, device=device)], dim=0
+                )
+                mask = torch.cat([mask, torch.zeros(pad_len, device=device)], dim=0)
+
+            padded_features.append(feat)
+            padded_masks.append(mask)
+
+        image_tokens = torch.stack(padded_features, dim=0)  # [B, T, D]
+        image_mask = torch.stack(padded_masks, dim=0)  # [B, T]
+
+        return image_tokens, image_mask
+
+    def forward(
+        self,
+        claim,
+        text_evidence,
+        video_evidence=None,
+        image_evidence=None,
+        labels=None,
+    ):
         device = next(self.parameters()).device
 
         # ---- Process claims ----
@@ -422,16 +571,21 @@ class MMFactCheckingClassifier(nn.Module):
         evidence_tokens = long_out.last_hidden_state  # (B, Le, Dl)
         evidence_mask = text_encoded["attention_mask"]  # (B, Le)
 
-        # ---- Encode videos ----
-        video_tokens, video_mask = self._process_videos(
-            video_evidence, batch_size, device
-        )  # (B, Tv, Dv), (B, Tv)
+        ### TODO: Add video processing
+
+        # ---- Encode images ----
+        image_tokens, image_mask = self._process_image(
+            image_evidence, batch_size, device
+        )  # (B, Ti, Di), (B, Ti)
+
+        # Add temporal positional encoding
+        image_tokens = self.temporal_pe_vision(image_tokens)
 
         claim_visual_fused = self.claim_video_trans(
             text_tokens=claim_tokens,
-            img_tokens=video_tokens,
+            img_tokens=image_tokens,
             text_mask=claim_mask,
-            img_mask=video_mask,
+            img_mask=image_mask,
         )  # (B, D_mfm)
 
         claim_evidence_fused = self.claim_evidence_trans(
@@ -441,14 +595,7 @@ class MMFactCheckingClassifier(nn.Module):
             img_mask=evidence_mask,
         )  # (B, D_mfm)
 
-        # h = torch.cat([claim_visual_fused, claim_evidence_fused], dim=-1)
         h = self.fusion_mlp(claim_visual_fused, claim_evidence_fused)
-        h = (
-            h
-            + self.inter_claim(claim_tokens).mean(dim=1)
-            + self.inter_video(video_tokens.mean(dim=1))
-            + self.inter_evidence(evidence_tokens.mean(dim=1))
-        )
         h = self.dropout(h)
         logits = self.classifier(h)  # (B, num_classes)
         probs = F.softmax(logits, dim=-1)
@@ -463,13 +610,17 @@ def run_quick_test(device_str: str = ""):
         device_str or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     cfg = MMConfig(num_classes=2)
-    model = MMFactCheckingClassifier(cfg).to(device)
+    model = CrossTransVFC(cfg).to(device)
     model.eval()
+
+    import glob
+
+    image_evidence = glob.glob("data\\TRUE_Dataset\\test_output\\10156802\\*")
 
     out = model(
         claim=["This claim is for smoke testing."],
         text_evidence=["This is a short evidence sentence."],
-        video_evidence=[None],
+        image_evidence=[image_evidence],
     )
 
     logits = out["logits"]

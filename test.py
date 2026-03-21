@@ -15,7 +15,7 @@ from sklearn.metrics import (
 )
 from tqdm import tqdm
 
-from models.model import MMConfig, MMFactCheckingClassifier
+from models.model import MMConfig, CrossTransVFC
 from utils.true_dataset import create_dataloaders
 
 
@@ -55,7 +55,7 @@ def evaluate(model, loader, device: torch.device):
         out = model(
             claim=batch["claim"],
             text_evidence=batch["content"],
-            video_evidence=batch["video_url"],
+            image_evidence=batch["keyframes"],
             labels=labels,
         )
         logits = out["logits"]
@@ -82,13 +82,13 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints\\best\\best.pt",
+        default="checkpoints/full_best_model.pt",
         help="Path to .pt file",
     )
     parser.add_argument(
         "--data-root",
         type=str,
-        default="../TRUE-3MFact/data/TRUE_Dataset",
+        default="./data/TRUE_Dataset",
         help="Dataset root directory",
     )
     parser.add_argument(
@@ -98,7 +98,7 @@ def main():
         choices=["train", "val", "test"],
         help="Dataset split to evaluate",
     )
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--output", type=str, default="", help="Optional JSON output path"
@@ -110,8 +110,15 @@ def main():
     checkpoint = load_checkpoint_compat(checkpoint_path, device)
 
     cfg = build_cfg_from_checkpoint(checkpoint)
-    model = MMFactCheckingClassifier(cfg).to(device)
+    model = CrossTransVFC(cfg).to(device)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = total_params * 4 / (1024**2)
+    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Model size (FP32 dtype): {model_size_mb:.2f} MB")
 
     label2id = checkpoint.get("label2id", {"TRUE": 0, "FALSE": 1})
     id2label = {v: k for k, v in label2id.items()}
@@ -130,6 +137,35 @@ def main():
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Evaluating split: {args.split}")
     print(f"Samples: {len(loader.dataset)}")
+
+    # Compute GFLOPs using one batch of data
+    try:
+        from fvcore.nn import FlopCountAnalysis
+
+        model.eval()
+        batch = next(iter(loader))
+        labels = normalize_labels(batch["label"]).to(device)
+
+        flops = FlopCountAnalysis(
+            model,
+            (
+                batch["claim"],
+                batch["content"],
+                batch["video_url"],
+                batch["keyframes"],
+                labels,
+            ),
+        )
+        flops.unsupported_ops_warnings(False)
+        print(
+            f"GFLOPs (fvcore): {flops.total() / 1e9:.3f} per batch (size={args.batch_size})"
+        )
+    except ImportError:
+        print("Install 'fvcore' to compute precise GFLOPs: pip install fvcore")
+    except Exception as e:
+        print(f"Could not compute GFLOPs: {e}")
+
+    return
 
     loss, acc, precision, recall, f1, y_true, y_pred = evaluate(model, loader, device)
 
