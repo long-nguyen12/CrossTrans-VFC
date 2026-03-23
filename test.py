@@ -174,15 +174,29 @@ def main():
     print(f"  Recall (macro avg): {recall:.4f}")
     print(f"  F1 (macro): {f1:.4f}")
     print("\nClassification Report:")
-    print(
-        classification_report(
-            y_true,
-            y_pred,
-            target_names=[id2label[i] for i in range(len(label2id))],
-            digits=4,
-            zero_division=0,
-        )
+    clf_report = classification_report(
+        y_true,
+        y_pred,
+        target_names=[id2label[i] for i in range(len(label2id))],
+        digits=4,
+        zero_division=0,
     )
+    print(clf_report)
+
+    log_path = (
+        checkpoint_path.parent / f"evaluation_{args.split}_{checkpoint_path.stem}.txt"
+    )
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"Evaluating split: {args.split}\n")
+        f.write(f"Loaded checkpoint: {checkpoint_path}\n")
+        f.write(f"Loss: {loss:.4f}\n")
+        f.write(f"Accuracy (avg): {acc:.4f}\n")
+        f.write(f"Precision (macro avg): {precision:.4f}\n")
+        f.write(f"Recall (macro avg): {recall:.4f}\n")
+        f.write(f"F1 (macro): {f1:.4f}\n\n")
+        f.write("Classification Report:\n")
+        f.write(clf_report + "\n")
+    print(f"\nSaved evaluation log to: {log_path}")
 
     if args.output:
         out_path = Path(args.output)

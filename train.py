@@ -276,6 +276,10 @@ def main(args):
         }
         json.dump(config_dict, f, indent=2)
 
+    train_log_path = run_dir / "train_log.csv"
+    with open(train_log_path, "w", encoding="utf-8") as f:
+        f.write("Epoch,Train_Loss,Val_Loss,Val_Acc,Val_F1\n")
+
     print(f"\n{'=' * 70}")
     print("Starting Training")
     print(f"{'=' * 70}\n")
@@ -309,6 +313,11 @@ def main(args):
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"Learning Rate: {current_lr:.2e}")
+
+        with open(train_log_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{ep},{tr_loss:.4f},{metrics['loss']:.4f},{metrics['acc']:.4f},{metrics['f1_macro']:.4f}\n"
+            )
 
         if metrics["f1_macro"] > best_f1:
             best_f1 = metrics["f1_macro"]
@@ -374,15 +383,22 @@ def main(args):
     print(f"  F1 (macro): {test_metrics['f1_macro']:.4f}")
 
     print("\nDetailed Classification Report:")
-    print(
-        classification_report(
-            y_true,
-            y_pred,
-            target_names=[id2label[i] for i in range(len(label2id))],
-            digits=4,
-            zero_division=0,
-        )
+    clf_report = classification_report(
+        y_true,
+        y_pred,
+        target_names=[id2label[i] for i in range(len(label2id))],
+        digits=4,
+        zero_division=0,
     )
+    print(clf_report)
+
+    with open(run_dir / "test_log.txt", "w", encoding="utf-8") as f:
+        f.write("Testing with Best Model\n")
+        f.write(f"Loss: {test_metrics['loss']:.4f}\n")
+        f.write(f"Accuracy: {test_metrics['acc']:.4f}\n")
+        f.write(f"F1 (macro): {test_metrics['f1_macro']:.4f}\n\n")
+        f.write("Detailed Classification Report:\n")
+        f.write(clf_report + "\n")
 
     test_results = {
         "test_loss": float(test_metrics["loss"]),
