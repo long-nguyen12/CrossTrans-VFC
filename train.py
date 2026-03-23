@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.amp import autocast, GradScaler
 
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, classification_report
@@ -54,16 +55,15 @@ def evaluate(model, loader, device, loss_func, desc="Evaluating") -> Dict[str, A
     for batch in tqdm(loader, desc=desc):
         labels = normalize_labels(batch["label"]).to(device)
 
-        out = model(
-            claim=batch["claim"],
-            text_evidence=batch["content"],
-            image_evidence=batch["keyframes"],
-            labels=labels,
-        )
-
-        logits = out["logits"]
-
-        loss = loss_func(logits, labels)
+        with autocast(device_type="cuda"):
+            out = model(
+                claim=batch["claim"],
+                text_evidence=batch["content"],
+                image_evidence=batch["keyframes"],
+                labels=labels,
+            )
+            logits = out["logits"]
+            loss = loss_func(logits, labels)
 
         preds = logits.argmax(dim=-1)
 
@@ -92,6 +92,7 @@ def train_one_epoch(
     loader,
     optimizer,
     scheduler,
+    scaler,
     ep,
     epochs,
     device,
@@ -105,21 +106,27 @@ def train_one_epoch(
     for batch in tqdm(loader, desc=f"Training {ep}/{epochs}"):
         labels = normalize_labels(batch["label"]).to(device)
 
-        out = model(
-            claim=batch["claim"],
-            text_evidence=batch["content"],
-            image_evidence=batch["keyframes"],
-            labels=labels,
-        )
-
-        logits = out["logits"]
-        loss = loss_func(logits, labels)
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+
+        with autocast(device_type="cuda"):
+            out = model(
+                claim=batch["claim"],
+                text_evidence=batch["content"],
+                image_evidence=batch["keyframes"],
+                labels=labels,
+            )
+            logits = out["logits"]
+            loss = loss_func(logits, labels)
+
+        scaler.scale(loss).backward()
+
         if grad_clip is not None and grad_clip > 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+
+        scaler.step(optimizer)
+        scaler.update()
+
         if scheduler is not None:
             scheduler.step()
 
@@ -239,6 +246,8 @@ def main(args):
         model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.999)
     )
 
+    scaler = GradScaler("cuda")
+
     total_steps = epochs * len(train_loader)
     warmup_steps = int(warmup_ratio * total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
@@ -249,8 +258,8 @@ def main(args):
 
     save_dir = Path("checkpoints")
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    run_dir = save_dir / time.strftime("%Y%m%d_%H%M%S")
+    dir_name = f"{args.saved_prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = save_dir / dir_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nCheckpoints will be saved to: {run_dir}")
@@ -281,6 +290,7 @@ def main(args):
             train_loader,
             optimizer,
             scheduler,
+            scaler,
             ep,
             epochs,
             device,
@@ -399,5 +409,6 @@ if __name__ == "__main__":
     parser.add_argument("--long_text_model", type=str, default="longformer")
     parser.add_argument("--image_model", type=str, default="clip")
     parser.add_argument("--video_model", type=str, default="videomae")
+    parser.add_argument("--saved-prefix", type=str, default="cross_trans_vfc")
     args = parser.parse_args()
     main(args)

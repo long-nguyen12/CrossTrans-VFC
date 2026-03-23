@@ -165,8 +165,6 @@ def main():
     except Exception as e:
         print(f"Could not compute GFLOPs: {e}")
 
-    return
-
     loss, acc, precision, recall, f1, y_true, y_pred = evaluate(model, loader, device)
 
     print("\nResults:")

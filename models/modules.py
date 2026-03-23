@@ -1,10 +1,35 @@
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
-from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+
+class AttentionPooling(nn.Module):
+    """Learnable attention-weighted pooling over a sequence."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.Tanh(),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        x: (B, L, D)
+        mask: (B, L) with 1 for valid, 0 for pad
+        Returns: (B, D)
+        """
+        w = self.attn(x).squeeze(-1)  # (B, L)
+        if mask is not None:
+            w = w.masked_fill(mask == 0, float("-inf"))
+        w = F.softmax(w, dim=-1)
+        return torch.bmm(w.unsqueeze(1), x).squeeze(1)  # (B, D)
 
 
 def masked_mean(
@@ -127,8 +152,8 @@ class MultimodalFusionModule(nn.Module):
                 [CrossAttention(d_model, n_heads, dropout) for _ in range(num_layers)]
             )
 
-        # Reserved for potential gating; not used in forward.
-        self.gate = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.Sigmoid())
+        self.text_pool = AttentionPooling(d_model)
+        self.img_pool = AttentionPooling(d_model)
 
         self.fuse_mlp = MLP(
             in_dim=2 * d_model,
@@ -157,8 +182,8 @@ class MultimodalFusionModule(nn.Module):
             else:
                 t = layer(q=t, k=i, v=i, k_padding_mask=img_kpm)
 
-        t_vec = masked_mean(t, text_mask, dim=1)
-        i_vec = masked_mean(i, img_mask, dim=1)
+        t_vec = self.text_pool(t, text_mask)
+        i_vec = self.img_pool(i, img_mask)
         fused = torch.cat([t_vec, i_vec], dim=-1)
         return self.fuse_mlp(fused)
 
@@ -169,12 +194,14 @@ class MultiHeadGatedFusion(nn.Module):
         dim1: int,
         dim2: int,
         out_dim: int,
+        dim3: int = 0,
         num_heads: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = out_dim // num_heads
+        self.has_dim3 = dim3 > 0
 
         self.proj1 = nn.ModuleList(
             [nn.Linear(dim1, self.head_dim) for _ in range(num_heads)]
@@ -183,9 +210,22 @@ class MultiHeadGatedFusion(nn.Module):
             [nn.Linear(dim2, self.head_dim) for _ in range(num_heads)]
         )
 
+        gate_in = dim1 + dim2
+        if self.has_dim3:
+            self.proj3 = nn.ModuleList(
+                [nn.Linear(dim3, self.head_dim) for _ in range(num_heads)]
+            )
+            gate_in += dim3
+
         self.gates = nn.ModuleList(
             [
-                nn.Sequential(nn.Linear(dim1 + dim2, self.head_dim), nn.Sigmoid())
+                nn.Sequential(
+                    nn.Linear(
+                        gate_in,
+                        3 * self.head_dim if self.has_dim3 else 2 * self.head_dim,
+                    ),
+                    nn.Softmax(dim=-1),
+                )
                 for _ in range(num_heads)
             ]
         )
@@ -193,17 +233,55 @@ class MultiHeadGatedFusion(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(out_dim)
 
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        """x1: (B, dim1), x2: (B, dim2)"""
-        combined_input = torch.cat([x1, x2], dim=-1)
+    def forward(
+        self, x1: torch.Tensor, x2: torch.Tensor, x3: torch.Tensor = None
+    ) -> torch.Tensor:
+        """x1: (B, dim1), x2: (B, dim2), x3: (B, dim3) optional"""
+        parts = [x1, x2]
+        if self.has_dim3 and x3 is not None:
+            parts.append(x3)
+        combined_input = torch.cat(parts, dim=-1)
 
         head_outputs = []
         for i in range(self.num_heads):
-            h1 = self.proj1[i](x1)
-            h2 = self.proj2[i](x2)
-            gate = self.gates[i](combined_input)
-            head_out = gate * h1 + (1 - gate) * h2
+            h1 = self.proj1[i](x1)  # (B, head_dim)
+            h2 = self.proj2[i](x2)  # (B, head_dim)
+
+            gate_raw = self.gates[i](combined_input)  # (B, 2*head_dim or 3*head_dim)
+
+            if self.has_dim3 and x3 is not None:
+                h3 = self.proj3[i](x3)  # (B, head_dim)
+                g1 = gate_raw[:, : self.head_dim]
+                g2 = gate_raw[:, self.head_dim : 2 * self.head_dim]
+                g3 = gate_raw[:, 2 * self.head_dim :]
+                head_out = g1 * h1 + g2 * h2 + g3 * h3
+            else:
+                g1 = gate_raw[:, : self.head_dim]
+                g2 = gate_raw[:, self.head_dim :]
+                head_out = g1 * h1 + g2 * h2
+
             head_outputs.append(head_out)
 
         fused = torch.cat(head_outputs, dim=-1)  # (B, out_dim)
         return self.norm(self.dropout(fused))
+
+
+class TemporalPositionalEncoding(nn.Module):
+    """
+    Injects timing/sequence information into the visual tokens.
+    """
+
+    def __init__(self, d_model, max_len=1000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len, :]
