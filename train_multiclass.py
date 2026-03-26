@@ -76,7 +76,18 @@ def build_hierarchical_loss(
 ):
     """Build a combined coarse + fine CE loss function."""
     coarse_ce = nn.CrossEntropyLoss(weight=coarse_weights).to(device)
-    fine_ce = nn.CrossEntropyLoss(weight=fine_weights, ignore_index=-1).to(device)
+
+    # Split fine weights for each coarse group
+    fine_ce_funcs = []
+    offset = 0
+    for n_fine in NUM_FINE_PER_COARSE:
+        w_c = (
+            fine_weights[offset : offset + n_fine] if fine_weights is not None else None
+        )
+        fine_ce_funcs.append(
+            nn.CrossEntropyLoss(weight=w_c, ignore_index=-1).to(device)
+        )
+        offset += n_fine
 
     def hierarchical_loss(coarse_logits, fine_logits, coarse_labels, fine_labels):
         loss_coarse = coarse_ce(coarse_logits, coarse_labels)
@@ -94,13 +105,17 @@ def build_hierarchical_loss(
             # Only use first n_fine_c columns
             logits_c = fine_logits[mask_c, :n_fine_c]
             targets_c = fine_labels[mask_c]
-            loss_fine = loss_fine + fine_ce(logits_c, targets_c) * mask_c.sum()
+            loss_fine = loss_fine + fine_ce_funcs[c](logits_c, targets_c) * mask_c.sum()
             n_fine_samples += mask_c.sum()
 
         if n_fine_samples > 0:
             loss_fine = loss_fine / n_fine_samples
 
-        return lambda_coarse * loss_coarse + lambda_fine * loss_fine, loss_coarse, loss_fine
+        return (
+            lambda_coarse * loss_coarse + lambda_fine * loss_fine,
+            loss_coarse,
+            loss_fine,
+        )
 
     return hierarchical_loss
 
@@ -191,16 +206,16 @@ def evaluate(model, loader, device, loss_func, desc="Evaluating") -> Dict[str, A
         all_flat_fine_pred.extend(flat_fine_preds)
 
     coarse_acc = accuracy_score(all_coarse_true, all_coarse_pred)
-    coarse_f1 = f1_score(all_coarse_true, all_coarse_pred, average="macro", zero_division=0)
+    coarse_f1 = f1_score(
+        all_coarse_true, all_coarse_pred, average="macro", zero_division=0
+    )
     flat_fine_acc = accuracy_score(all_flat_fine_true, all_flat_fine_pred)
     flat_fine_f1 = f1_score(
         all_flat_fine_true, all_flat_fine_pred, average="macro", zero_division=0
     )
 
     # Hierarchical consistency: fine pred consistent with coarse pred
-    consistent = sum(
-        1 for ct, cp in zip(all_coarse_true, all_coarse_pred) if ct == cp
-    )
+    consistent = sum(1 for ct, cp in zip(all_coarse_true, all_coarse_pred) if ct == cp)
     consistency = consistent / max(len(all_coarse_true), 1)
 
     return {
@@ -218,8 +233,16 @@ def evaluate(model, loader, device, loss_func, desc="Evaluating") -> Dict[str, A
 
 
 def train_one_epoch(
-    model, loader, optimizer, scheduler, scaler, ep, epochs,
-    device, loss_func, grad_clip=1.0,
+    model,
+    loader,
+    optimizer,
+    scheduler,
+    scaler,
+    ep,
+    epochs,
+    device,
+    loss_func,
+    grad_clip=1.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -369,11 +392,11 @@ def main(args):
     coarse_weights, coarse_counts = compute_class_weights(
         train_loader.dataset, cfg.num_classes, device
     )
-    fine_weights, fine_counts = compute_fine_class_weights(
-        train_loader.dataset, device
-    )
+    fine_weights, fine_counts = compute_fine_class_weights(train_loader.dataset, device)
 
-    print(f"\nCoarse class counts: TRUE={int(coarse_counts[0])}, FALSE={int(coarse_counts[1])}")
+    print(
+        f"\nCoarse class counts: TRUE={int(coarse_counts[0])}, FALSE={int(coarse_counts[1])}"
+    )
     print(f"Fine class counts: {fine_counts.int().tolist()}")
 
     loss_func = build_hierarchical_loss(
@@ -391,7 +414,9 @@ def main(args):
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr, weight_decay=0.01, betas=(0.9, 0.999),
+        lr=lr,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
     )
     scaler = GradScaler("cuda")
 
@@ -436,7 +461,9 @@ def main(args):
 
     train_log_path = run_dir / "train_log.csv"
     with open(train_log_path, "w", encoding="utf-8") as f:
-        f.write("Epoch,Train_Loss,Val_Loss,Val_Coarse_Acc,Val_Coarse_F1,Val_Fine_Acc,Val_Fine_F1\n")
+        f.write(
+            "Epoch,Train_Loss,Val_Loss,Val_Coarse_Acc,Val_Coarse_F1,Val_Fine_Acc,Val_Fine_F1\n"
+        )
 
     # ====== Training loop ======
     print(f"\n{'=' * 70}")
@@ -449,8 +476,16 @@ def main(args):
         print(f"{'=' * 70}")
 
         tr_loss = train_one_epoch(
-            model, train_loader, optimizer, scheduler, scaler,
-            ep, epochs, device, loss_func, grad_clip=1.0,
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            ep,
+            epochs,
+            device,
+            loss_func,
+            grad_clip=1.0,
         )
         metrics = evaluate(model, val_loader, device, loss_func)
 
@@ -606,14 +641,26 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--lambda_coarse", type=float, default=1.0,
-                        help="Weight for coarse (binary) loss")
-    parser.add_argument("--lambda_fine", type=float, default=1.0,
-                        help="Weight for fine-grained loss")
-    parser.add_argument("--pretrained_ckpt", type=str, default="",
-                        help="Path to pre-trained binary CrossTransVFC checkpoint")
-    parser.add_argument("--freeze_backbone", action="store_true",
-                        help="Freeze backbone, only train hierarchical heads")
+    parser.add_argument(
+        "--lambda_coarse",
+        type=float,
+        default=1.0,
+        help="Weight for coarse (binary) loss",
+    )
+    parser.add_argument(
+        "--lambda_fine", type=float, default=1.0, help="Weight for fine-grained loss"
+    )
+    parser.add_argument(
+        "--pretrained_ckpt",
+        type=str,
+        default="",
+        help="Path to pre-trained binary CrossTransVFC checkpoint",
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        help="Freeze backbone, only train hierarchical heads",
+    )
     parser.add_argument("--text_model", type=str, default="roberta-base")
     parser.add_argument("--long_text_model", type=str, default="longformer")
     parser.add_argument("--image_model", type=str, default="clip")
