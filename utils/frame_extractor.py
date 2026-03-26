@@ -83,7 +83,7 @@ def _select_representative_frame_spectral(
     frames,
     embeddings,
     n_clusters,
-    plot_clusters=True,
+    plot_clusters=False,
     plot_path=None,
     plot_title=None,
 ):
